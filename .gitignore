@@ -1,3 +1,8 @@
 .DS_Store
 # Local secrets only — never commit real API keys
 .claude-keys.zsh
+linkedin_carousel_outline.md
+linkedin_post.md
+medium_article.md
+substack_article.md
+claude_readme.md
