@@ -1,0 +1,139 @@
+# Paste this block into your `~/.zshrc` (adjust paths if needed).
+#
+# Notes:
+# - Keep secrets (API keys) out of `~/.zshrc`
+# - This block assumes Ollama is running on http://localhost:11444
+
+alias la="ls -A"
+
+# Claude router block
+
+# Keys live in ~/.claude-keys.zsh (NVIDIA + OpenRouter).
+if [ -f "$HOME/.claude-keys.zsh" ]; then
+  source "$HOME/.claude-keys.zsh"
+fi
+
+# Model catalog (edit these)
+_NVIDIA_MODELS=(
+  "deepseek-ai/deepseek-v3.2"
+  "moonshotai/kimi-k2-instruct"
+  "z-ai/glm4.7"
+)
+
+_OPENROUTER_MODELS=(
+  "stepfun/step-3.5-flash:free"
+  "z-ai/glm-4.5-air:free"
+  "nvidia/nemotron-3-super-120b-a12b:free"
+  "nvidia/nemotron-3-nano-30b-a3b:free"
+)
+
+_OLLAMA_MODELS=("qwen3.5:4b")
+
+# Quick local run (avoids token/key auth conflicts by unsetting ANTHROPIC_*).
+alias claude-local='env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL=http://localhost:11444 claude --model qwen3.5:4b'
+
+_claude_pick_key() {
+  # args: array_name index_var_name
+  local array_name="$1"
+  local index_var="$2"
+  local -a keys
+  eval "keys=(\"\${${array_name}[@]}\")"
+
+  if (( ${#keys[@]} == 0 )); then
+    echo ""
+    return 0
+  fi
+
+  # Initialize the rotation index if needed.
+  eval ": \${${index_var}:=0}"
+  local idx
+  eval "idx=\"\${${index_var}}\""
+  if (( idx >= ${#keys[@]} )); then
+    idx=0
+  fi
+
+  # Select key for this call, then advance index for next time.
+  local key="${keys[$((idx+1))]}"
+  idx=$(( (idx + 1) % ${#keys[@]} ))
+  eval "${index_var}=${idx}"
+  echo "$key"
+}
+
+claude-free() {
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "claude-free: 'claude' command not found."
+    return 1
+  fi
+
+  local -a options
+  local -A providerByChoice
+  local -A modelByChoice
+  local -i i=1
+  local m
+
+  for m in "${_NVIDIA_MODELS[@]}"; do
+    options+=("NVIDIA    | ${m}")
+    providerByChoice[$i]="nvidia"
+    modelByChoice[$i]="$m"
+    i=$((i+1))
+  done
+
+  for m in "${_OPENROUTER_MODELS[@]}"; do
+    options+=("OpenRouter| ${m}")
+    providerByChoice[$i]="openrouter"
+    modelByChoice[$i]="$m"
+    i=$((i+1))
+  done
+
+  for m in "${_OLLAMA_MODELS[@]}"; do
+    options+=("Ollama    | ${m}")
+    providerByChoice[$i]="ollama"
+    modelByChoice[$i]="$m"
+    i=$((i+1))
+  done
+
+  if (( ${#options[@]} == 0 )); then
+    echo "claude-free: no models configured."
+    return 1
+  fi
+
+  echo "Select a model:"
+  select opt in "${options[@]}"; do
+    [[ -z "$opt" ]] && echo "Invalid selection." && continue
+    local choice="$REPLY"
+    local provider="${providerByChoice[$choice]}"
+    local model="${modelByChoice[$choice]}"
+    [[ -z "$provider" || -z "$model" ]] && echo "Invalid selection." && continue
+
+    local base_url api_key
+    if [[ "$provider" == "nvidia" ]]; then
+      base_url="https://integrate.api.nvidia.com/v1"
+      api_key="$(_claude_pick_key _NVIDIA_KEYS _NVIDIA_KEY_INDEX)"
+      [[ -z "$api_key" ]] && echo "claude-free: no NVIDIA keys configured in ~/.claude-keys.zsh" && return 1
+    elif [[ "$provider" == "openrouter" ]]; then
+      base_url="https://openrouter.ai/api/v1"
+      api_key="$(_claude_pick_key _OPENROUTER_KEYS _OPENROUTER_KEY_INDEX)"
+      [[ -z "$api_key" ]] && echo "claude-free: no OpenRouter keys configured in ~/.claude-keys.zsh" && return 1
+    else
+      base_url="http://localhost:11444"
+      api_key=""
+    fi
+
+    echo "claude-free -> $provider | model=$model"
+
+    # Ollama does not need (and should not see) ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN.
+    if [[ "$provider" == "ollama" ]]; then
+      env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY \
+        ANTHROPIC_BASE_URL="$base_url" \
+        claude --model "$model" "$@"
+    else
+      env -u ANTHROPIC_AUTH_TOKEN \
+        ANTHROPIC_API_KEY="$api_key" \
+        ANTHROPIC_BASE_URL="$base_url" \
+        claude --model "$model" "$@"
+    fi
+
+    return $?
+  done
+}
+
