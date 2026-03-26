@@ -1,8 +1,11 @@
+# This file matches only the Claude-specific section of ~/.zshrc, not the full file.
 # Paste this block into your `~/.zshrc` (adjust paths if needed).
 #
 # Notes:
 # - Keep secrets (API keys) out of `~/.zshrc`
-# - This block assumes Ollama is running on http://localhost:11444
+# - Ollama default port is 11434. If you use a custom port (e.g. 11444), set before this block:
+#     export _CLAUDE_OLLAMA_URL='http://localhost:11444'
+#   or put that line in ~/.claude-keys.zsh (sourced below).
 
 alias la="ls -A"
 
@@ -12,6 +15,9 @@ alias la="ls -A"
 if [ -f "$HOME/.claude-keys.zsh" ]; then
   source "$HOME/.claude-keys.zsh"
 fi
+
+# Ollama HTTP API base (must match `ollama serve` / OLLAMA_HOST). Default matches standard Ollama.
+: "${_CLAUDE_OLLAMA_URL:=http://localhost:11434}"
 
 # Model catalog (edit these)
 _NVIDIA_MODELS=(
@@ -29,8 +35,11 @@ _OPENROUTER_MODELS=(
 
 _OLLAMA_MODELS=("qwen3.5:4b")
 
-# Quick local run (avoids token/key auth conflicts by unsetting ANTHROPIC_*).
-alias claude-local='env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL=http://localhost:11444 claude --model qwen3.5:4b'
+# Quick local run (Ollama). Dummy token+key + --bare:
+# - Without --bare, interactive TUI often still hits Anthropic OAuth/keychain and shows "Not logged in"
+#   even when ANTHROPIC_BASE_URL points at Ollama (`claude --help` documents --bare skipping keychain/OAuth).
+# See: https://docs.ollama.com/integrations/claude-code
+alias claude-local="ANTHROPIC_AUTH_TOKEN=ollama ANTHROPIC_API_KEY=ollama ANTHROPIC_BASE_URL=${_CLAUDE_OLLAMA_URL} claude --bare --model qwen3.5:4b"
 
 _claude_pick_key() {
   # args: array_name index_var_name
@@ -57,6 +66,30 @@ _claude_pick_key() {
   idx=$(( (idx + 1) % ${#keys[@]} ))
   eval "${index_var}=${idx}"
   echo "$key"
+}
+
+_nvidia_key_for_model() {
+  # Choose a key that can actually serve the selected NVIDIA model.
+  # Some keys intermittently timeout or lack access for specific models.
+  local model="$1"
+  local endpoint="https://integrate.api.nvidia.com/v1/chat/completions"
+  local key code idx=1
+  for key in "${_NVIDIA_KEYS[@]}"; do
+    code="$(curl -m 12 -sS -o /dev/null -w "%{http_code}" \
+      "$endpoint" \
+      -H "Authorization: Bearer $key" \
+      -H "Content-Type: application/json" \
+      -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":8}" 2>/dev/null)"
+    if [[ "$code" == "200" ]]; then
+      # Keep rotation index aligned with last known-good key.
+      _NVIDIA_KEY_INDEX=$((idx % ${#_NVIDIA_KEYS[@]}))
+      echo "$key"
+      return 0
+    fi
+    idx=$((idx+1))
+  done
+  echo ""
+  return 1
 }
 
 claude-free() {
@@ -107,33 +140,99 @@ claude-free() {
 
     local base_url api_key
     if [[ "$provider" == "nvidia" ]]; then
-      base_url="https://integrate.api.nvidia.com/v1"
-      api_key="$(_claude_pick_key _NVIDIA_KEYS _NVIDIA_KEY_INDEX)"
-      [[ -z "$api_key" ]] && echo "claude-free: no NVIDIA keys configured in ~/.claude-keys.zsh" && return 1
+      echo "claude-free -> nvidia | model=$model (via claudish proxy)"
+      claudish-nvidia "$model" "$@"
+      return $?
     elif [[ "$provider" == "openrouter" ]]; then
       base_url="https://openrouter.ai/api/v1"
       api_key="$(_claude_pick_key _OPENROUTER_KEYS _OPENROUTER_KEY_INDEX)"
       [[ -z "$api_key" ]] && echo "claude-free: no OpenRouter keys configured in ~/.claude-keys.zsh" && return 1
     else
-      base_url="http://localhost:11444"
+      base_url="${_CLAUDE_OLLAMA_URL:-http://localhost:11434}"
       api_key=""
     fi
 
     echo "claude-free -> $provider | model=$model"
 
-    # Ollama does not need (and should not see) ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN.
+    # Ollama: Claude Code expects *some* Anthropic-compat credentials; use Ollama’s dummy token+key.
+    # Unsetting both causes "Not logged in · Please run /login" (especially after `claude /logout`).
     if [[ "$provider" == "ollama" ]]; then
-      env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY \
-        ANTHROPIC_BASE_URL="$base_url" \
-        claude --model "$model" "$@"
+      ANTHROPIC_AUTH_TOKEN=ollama \
+      ANTHROPIC_API_KEY=ollama \
+      ANTHROPIC_BASE_URL="$base_url" \
+        claude --bare --model "$model" "$@"
     else
       env -u ANTHROPIC_AUTH_TOKEN \
         ANTHROPIC_API_KEY="$api_key" \
         ANTHROPIC_BASE_URL="$base_url" \
-        claude --model "$model" "$@"
+        claude --bare --model "$model" "$@"
     fi
 
     return $?
   done
 }
 
+# ─── Claudish + NVIDIA NIM (OpenAI-compatible API) ─────────────────────
+# Raw `claude` + ANTHROPIC_BASE_URL → integrate.api.nvidia.com often fails because
+# Claude Code speaks Anthropic protocol; NVIDIA integrate speaks OpenAI chat/completions.
+# Claudish translates Anthropic ↔ OpenAI. Use provider shortcut: oai@<model_id>
+# Requires: `npm install -g claudish` and Bun (~/.bun/bin). See: https://github.com/MadAppGang/claudish
+claudish-nvidia() {
+  export PATH="${BUN_INSTALL:-$HOME/.bun}/bin:$PATH"
+  if ! command -v claudish >/dev/null 2>&1; then
+    echo "claudish-nvidia: install with: npm install -g claudish  (and Bun: https://bun.sh)"
+    return 1
+  fi
+  local model="${1:-deepseek-ai/deepseek-v3.2}"
+  shift
+  local api_key
+  api_key="$(_nvidia_key_for_model "$model")"
+  [[ -z "$api_key" ]] && api_key="$(_claude_pick_key _NVIDIA_KEYS _NVIDIA_KEY_INDEX)"
+  if [[ -z "$api_key" ]]; then
+    echo "claudish-nvidia: add nvapi keys to ~/.claude-keys.zsh (_NVIDIA_KEYS)"
+    return 1
+  fi
+  echo "claudish-nvidia -> oai@${model} (OPENAI_BASE_URL=NVIDIA integrate)"
+  # Placeholder suppresses Claude Code login prompt; real chat goes to NVIDIA via OpenAI client.
+  # CLAUDISH_DIAG_MODE=off: skip Claudish's mtm wrapper so the TUI matches plain `claude` (readable).
+  # Restore Claudish diagnostics: `CLAUDISH_DIAG_MODE=auto claudish-nvidia` or `--diag-mode auto`.
+  env OPENAI_BASE_URL="https://integrate.api.nvidia.com" \
+    OPENAI_API_KEY="$api_key" \
+    ANTHROPIC_API_KEY="sk-ant-api03-placeholder" \
+    CLAUDISH_DIAG_MODE="${CLAUDISH_DIAG_MODE:-off}" \
+    claudish --model "oai@${model}" "$@"
+}
+
+claudish-nvidia-free() {
+  export PATH="${BUN_INSTALL:-$HOME/.bun}/bin:$PATH"
+  if ! command -v claudish >/dev/null 2>&1; then
+    echo "claudish-nvidia-free: install claudish first (npm install -g claudish + Bun)"
+    return 1
+  fi
+  local -a options
+  local -A modelByChoice
+  local -i i=1
+  local m
+  for m in "${_NVIDIA_MODELS[@]}"; do
+    options+=("${m}")
+    modelByChoice[$i]="$m"
+    i=$((i+1))
+  done
+  echo "NVIDIA models via Claudish (pick one):"
+  select opt in "${options[@]}"; do
+    [[ -z "$opt" ]] && echo "Invalid selection." && continue
+    local choice="$REPLY"
+    local model="${modelByChoice[$choice]}"
+    [[ -z "$model" ]] && echo "Invalid selection." && continue
+    claudish-nvidia "$model" "$@"
+    return $?
+  done
+}
+
+
+# bun completions
+[ -s "/Users/aryamandev/.bun/_bun" ] && source "/Users/aryamandev/.bun/_bun"
+
+# bun
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"

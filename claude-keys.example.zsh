@@ -7,6 +7,8 @@
 #
 # Never commit real keys to git or share them in screenshots.
 #
+# Optional: if Ollama listens on a non-default port (default is 11434):
+# export _CLAUDE_OLLAMA_URL='http://localhost:11444'
 
 # NVIDIA NIM keys (nvapi-...)
 _NVIDIA_KEYS=(
